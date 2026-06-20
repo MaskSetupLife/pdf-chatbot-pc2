@@ -12,9 +12,9 @@ from streamlit_pdf_viewer import pdf_viewer
 # =======================
 
 GOOGLE_API_KEY = st.secrets["app"]["GOOGLE_API_KEY"]
-MONGODB_URI = st.secrets["app"]["MONGODB_URI"]
+MONGODB_URI    = st.secrets["app"]["MONGODB_URI"]
 COHERE_API_KEY = st.secrets["app"]["COHERE_API_KEY"]
-USER = st.secrets["app"].get("USER", "")
+USER           = st.secrets["app"].get("USER", "")
 
 if not GOOGLE_API_KEY or not MONGODB_URI:
     st.error("❌ Faltan GOOGLE_API_KEY o MONGODB_URI en secrets")
@@ -23,45 +23,76 @@ if not GOOGLE_API_KEY or not MONGODB_URI:
 gemini_client = genai.Client(api_key=GOOGLE_API_KEY)
 co = cohere.Client(COHERE_API_KEY)
 
-# MongoDB
-client = pymongo.MongoClient(MONGODB_URI)
-db = client["pdf_embeddings_db"]
-collection = db["pdf_vectors"]
-fs = gridfs.GridFS(db)
+# MongoDB — con timeout explícito para fallo rápido y mensaje claro
+try:
+    mongo_client = pymongo.MongoClient(
+        MONGODB_URI,
+        serverSelectionTimeoutMS=10_000,   # 10 s máximo para conectar
+        connectTimeoutMS=10_000,
+    )
+    # Verifica la conexión inmediatamente
+    mongo_client.admin.command("ping")
+except pymongo.errors.ServerSelectionTimeoutError:
+    st.error(
+        "❌ No se pudo conectar a MongoDB Atlas.\n\n"
+        "**Pasos para solucionarlo:**\n"
+        "1. Ve a MongoDB Atlas → Network Access\n"
+        "2. Agrega la entrada `0.0.0.0/0` (Allow Access from Anywhere)\n"
+        "3. Verifica que el MONGODB_URI en secrets sea correcto (usuario y contraseña)"
+    )
+    st.stop()
+except Exception as e:
+    st.error(f"❌ Error de conexión: {e}")
+    st.stop()
 
+db         = mongo_client["pdf_embeddings_db"]
+collection = db["pdf_vectors"]
+fs         = gridfs.GridFS(db)
+
+
+# =======================
+# ÍNDICE VECTORIAL
+# =======================
 
 def crear_indice_vectorial():
+    """Crea el índice vectorial en Atlas si aún no existe.
+    
+    CORRECCIONES respecto a la versión original:
+    - Eliminado el insert_one({"a":"sample"}) que causaba el crash.
+    - Usa el cliente global (no crea uno nuevo).
+    - Manejo de errores para no interrumpir el inicio de la app.
+    """
     from pymongo.operations import SearchIndexModel
-    # Conexión a MongoDB Atlas
-    client = pymongo.MongoClient(MONGODB_URI)
-    db = client.pdf_embeddings_db
-    collection = db.pdf_vectors
-    collection.insert_one({"a":"sample"})
+    try:
+        existing_indexes = [idx["name"] for idx in collection.list_search_indexes()]
+        if "vector_index" in existing_indexes:
+            return  # Ya existe, nada que hacer
 
-    existing_indexes = [idx["name"] for idx in collection.list_search_indexes()]
-    if "vector_index" in existing_indexes:
-        return
+        search_index_model = SearchIndexModel(
+            definition={
+                "fields": [
+                    {
+                        "type": "vector",
+                        "path": "embedding",
+                        "similarity": "cosine",
+                        "numDimensions": 1024,
+                    }
+                ]
+            },
+            name="vector_index",
+            type="vectorSearch",
+        )
+        collection.create_search_index(model=search_index_model)
+        st.info("⏳ Creando índice vectorial en Atlas… espera ~20 s y recarga la página.")
+        time.sleep(20)
 
-    search_index_model = SearchIndexModel(
-        definition={
-            "fields": [
-                {
-                    "type": "vector",
-                    "path": "embedding",
-                    "similarity": "cosine",
-                    "numDimensions": 1024,
-                }
-            ]
-        },
-        name="vector_index",
-        type="vectorSearch",
-    )
-
-    collection.create_search_index(model=search_index_model)
-    time.sleep(20)
+    except Exception as e:
+        # No detiene la app: el índice puede ya existir o crearse luego
+        st.warning(f"⚠️ No se pudo verificar/crear el índice vectorial: {e}")
 
 
 crear_indice_vectorial()
+
 
 # =======================
 # FUNCIONES PDF + EMBEDDING
@@ -76,7 +107,7 @@ def leer_pdf(archivo):
 
 
 def crear_embedding(texto, input_type="search_document"):
-    """Genera embeddings usando Cohere v3 (multilenguaje, 1024 dim)."""
+    """Genera embeddings con Cohere (multilenguaje, 1024 dim)."""
     resp = co.embed(
         model="embed-multilingual-v3.0",
         texts=[texto],
@@ -86,17 +117,17 @@ def crear_embedding(texto, input_type="search_document"):
 
 
 def procesar_pdf(archivo_pdf, nombre_pdf):
-    """Lee PDF, genera embeddings y guarda texto + PDF en MongoDB."""
+    """Lee el PDF, genera embeddings y guarda todo en MongoDB."""
     st.info("📄 Leyendo PDF...")
-
     texto = leer_pdf(archivo_pdf)
     if not texto:
-        st.error("El PDF no contiene texto.")
+        st.error("El PDF no contiene texto extraíble.")
         return None
 
     trozos = [texto[i:i + 1000] for i in range(0, len(texto), 1000)]
 
     documentos = []
+    progress = st.progress(0, text="Generando embeddings…")
     for i, chunk in enumerate(trozos):
         embedding = crear_embedding(chunk)
         documentos.append({
@@ -105,11 +136,13 @@ def procesar_pdf(archivo_pdf, nombre_pdf):
             "texto": chunk,
             "embedding": embedding,
         })
+        progress.progress((i + 1) / len(trozos), text=f"Fragmento {i+1}/{len(trozos)}")
 
+    progress.empty()
     collection.insert_many(documentos)
 
-    # Guardar PDF en GridFS (reemplaza a Backblaze)
-    st.info("📤 Guardando PDF en MongoDB...")
+    # Guardar PDF original en GridFS
+    st.info("📤 Guardando PDF en MongoDB GridFS...")
     if fs.exists({"filename": nombre_pdf}):
         for f in fs.find({"filename": nombre_pdf}):
             fs.delete(f._id)
@@ -117,19 +150,19 @@ def procesar_pdf(archivo_pdf, nombre_pdf):
 
     return len(documentos)
 
+
 # =======================
 # VISOR PDF DESDE MONGODB
 # =======================
 
 def obtener_pdf(nombre_pdf):
-    """Devuelve los bytes del PDF almacenado en GridFS."""
     archivo = fs.find_one({"filename": nombre_pdf})
     return archivo.read() if archivo else None
 
 
 def mostrar_pdf(pdf_bytes):
-    """Muestra PDF embebido con pdf.js (compatible con Chrome)."""
     pdf_viewer(input=pdf_bytes, width=700)
+
 
 # =======================
 # VECTOR SEARCH + CHAT
@@ -167,7 +200,7 @@ Contexto:
 
 Pregunta: {pregunta}
 
-Responde en español, de forma clara.
+Responde en español, de forma clara y detallada.
 """
     respuesta = gemini_client.models.generate_content(
         model="gemini-2.5-flash",
@@ -175,12 +208,13 @@ Responde en español, de forma clara.
     )
     return respuesta.text
 
+
 # =======================
 # INTERFAZ STREAMLIT
 # =======================
 
-st.set_page_config(page_title="ChatBot", page_icon="📚")
-st.title("📚 Chat con PDFs en MongoDB + Gemini + Cohere: " + USER)
+st.set_page_config(page_title="ChatBot PDF", page_icon="📚")
+st.title("📚 Chat con PDFs — MongoDB + Gemini + Cohere: " + USER)
 
 archivo_pdf = st.file_uploader("📤 Sube un PDF", type=["pdf"])
 
@@ -188,12 +222,12 @@ if archivo_pdf:
     if st.button("Procesar y guardar PDF"):
         with st.spinner("Procesando PDF..."):
             cantidad = procesar_pdf(archivo_pdf, archivo_pdf.name)
-            st.success(f"Procesado: {cantidad} fragmentos generados y PDF guardado.")
-
-        st.info("📖 Vista previa del PDF desde MongoDB:")
-        pdf_bytes = obtener_pdf(archivo_pdf.name)
-        if pdf_bytes:
-            mostrar_pdf(pdf_bytes)
+        if cantidad:
+            st.success(f"✅ Procesado: {cantidad} fragmentos generados y PDF guardado.")
+            st.info("📖 Vista previa del PDF desde MongoDB:")
+            pdf_bytes = obtener_pdf(archivo_pdf.name)
+            if pdf_bytes:
+                mostrar_pdf(pdf_bytes)
 
 # ---------------- Chat ----------------
 
@@ -210,7 +244,7 @@ if pregunta:
         similares = buscar_similares(emb)
 
         if not similares:
-            respuesta = "No encontré información relevante."
+            respuesta = "No encontré información relevante en el documento. ¿Ya procesaste un PDF?"
         else:
             respuesta = generar_respuesta(pregunta, similares)
 

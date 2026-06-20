@@ -1,0 +1,6 @@
+streamlit
+pymongo
+google-genai
+cohere
+PyPDF2
+streamlit-pdf-viewer
